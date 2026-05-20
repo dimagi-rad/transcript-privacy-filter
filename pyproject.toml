@@ -12,13 +12,21 @@ dependencies = [
   "huggingface_hub",
   "numpy",
   "packaging",
+  "pypdf",
+  "python-docx",
   "torch",
   "safetensors",
+  "streamlit",
   "tiktoken",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
 ]
 
 [project.scripts]
 opf = "opf.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["opf*"]
+include = ["opf*", "opf_app*"]
