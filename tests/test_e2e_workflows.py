@@ -43,6 +43,29 @@ class CategoryRedactor:
         )
 
 
+class StructuralTimestampRedactor:
+    def redact(self, text: str) -> FakeOpfResult:
+        timestamp_start = text.index("00:00")
+        body_date_start = text.index("2026-05-17")
+        return FakeOpfResult(
+            text=text,
+            detected_spans=(
+                SpanForReplacement(
+                    "private_date",
+                    timestamp_start,
+                    timestamp_start + len("00:00"),
+                    "<PRIVATE_DATE>",
+                ),
+                SpanForReplacement(
+                    "private_date",
+                    body_date_start,
+                    body_date_start + len("2026-05-17"),
+                    "<PRIVATE_DATE>",
+                ),
+            ),
+        )
+
+
 class FailingOnTextRedactor:
     def __init__(self, fail_text: str) -> None:
         self.fail_text = fail_text
@@ -134,6 +157,26 @@ def test_e2e_category_filtering_through_pipeline(tmp_path: Path) -> None:
     paragraphs = _paragraphs(output_path)
     assert "<PRIVATE_PERSON> token-12345" in paragraphs
     assert "<SECRET>" not in paragraphs
+
+
+def test_e2e_structural_timestamps_survive_private_date_redaction(
+    tmp_path: Path,
+) -> None:
+    item = _item("timestamp", "[00:00] S1: Appointment was on 2026-05-17.")
+
+    result = run_redaction_batch(
+        (item,),
+        selected_labels=("private_date",),
+        redaction_service=RedactionService(StructuralTimestampRedactor()),
+        output_dir=tmp_path,
+        concurrency=1,
+    )
+
+    assert result.complete_count == 1
+    output_path = result.items[0].output.path
+    assert output_path is not None
+    paragraphs = _paragraphs(output_path)
+    assert "[00:00] S1: Appointment was on <PRIVATE_DATE>." in paragraphs
 
 
 def test_e2e_one_failed_item_keeps_successful_zip_outputs(tmp_path: Path) -> None:

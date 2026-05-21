@@ -74,6 +74,7 @@ def run_redaction_batch(
     selected_labels: Iterable[str],
     redaction_service: RedactionService,
     output_dir: str | Path,
+    preserved_values: Iterable[str] = (),
     concurrency: int | None = DEFAULT_CONCURRENCY,
     lock_redactor: bool = False,
     progress_callback: ProgressCallback | None = None,
@@ -83,6 +84,7 @@ def run_redaction_batch(
     total_count = len(parsed_items)
     worker_count = clamp_concurrency(concurrency)
     labels = tuple(selected_labels)
+    values_to_preserve = tuple(preserved_values)
     progress_events: list[BatchProgressEvent] = []
     progress_lock = threading.Lock()
     redactor_lock = threading.Lock()
@@ -125,11 +127,13 @@ def run_redaction_batch(
                         result = redaction_service.redact_item(
                             item,
                             selected_labels=labels,
+                            preserved_values=values_to_preserve,
                         )
                 else:
                     result = redaction_service.redact_item(
                         item,
                         selected_labels=labels,
+                        preserved_values=values_to_preserve,
                     )
             except Exception as exc:  # noqa: BLE001 - keep batch item isolated
                 result = RedactionResult(

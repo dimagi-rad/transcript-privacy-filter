@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+import re
 from typing import Any, Callable, Protocol
 
 from opf._common.label_space import BACKGROUND_CLASS_LABEL, SPAN_CLASS_NAMES_BY_CATEGORY_VERSION
@@ -14,6 +15,9 @@ DEFAULT_RUNTIME_LABELS = tuple(
     label
     for label in SPAN_CLASS_NAMES_BY_CATEGORY_VERSION["v2"]
     if label != BACKGROUND_CLASS_LABEL
+)
+_STRUCTURAL_TIMESTAMP_HEADER_PATTERN = re.compile(
+    r"(?m)^(?P<timestamp_token>\[[^\]\n]+\])\s+[A-Za-z][A-Za-z0-9_-]*:"
 )
 
 
@@ -50,8 +54,14 @@ class RedactionService:
         item: ParsedItem,
         *,
         selected_labels: Iterable[str],
+        preserved_values: Iterable[str] = (),
     ) -> RedactionResult:
-        return redact_item(item, self.redactor, selected_labels=selected_labels)
+        return redact_item(
+            item,
+            self.redactor,
+            selected_labels=selected_labels,
+            preserved_values=preserved_values,
+        )
 
 
 def create_typed_opf_redactor(**kwargs: object) -> RedactorLike:
@@ -87,9 +97,11 @@ def redact_item(
     redactor: RedactorLike,
     *,
     selected_labels: Iterable[str],
+    preserved_values: Iterable[str] = (),
 ) -> RedactionResult:
     """Run OPF and apply placeholders only for selected categories."""
     selected_label_set = set(selected_labels)
+    preserved_value_set = _normalized_preserved_value_set(preserved_values)
     try:
         opf_result = redactor.redact(item.body_text)
     except Exception as exc:  # noqa: BLE001 - convert per-item failures to result state
@@ -105,8 +117,11 @@ def redact_item(
 
     spans = _coerce_spans(getattr(opf_result, "detected_spans", ()))
     text = str(getattr(opf_result, "text", item.body_text))
-    selected_spans = tuple(
-        span for span in spans if span.label in selected_label_set
+    selected_spans = _selected_unprotected_spans(
+        text,
+        spans,
+        selected_labels=selected_label_set,
+        preserved_values=preserved_value_set,
     )
     redacted_text = apply_selected_replacements(text, selected_spans)
     detected_counts = _count_by_label(spans)
@@ -154,6 +169,79 @@ def apply_selected_replacements(
         cursor = end
     pieces.append(text[cursor:])
     return "".join(pieces)
+
+
+def parse_preserved_values(raw_values: str) -> tuple[str, ...]:
+    """Parse comma-separated values while preserving input order."""
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values.split(","):
+        value = raw_value.strip()
+        normalized = _normalize_preserved_value(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(value)
+    return tuple(values)
+
+
+def _selected_unprotected_spans(
+    text: str,
+    spans: Iterable[SpanForReplacement],
+    *,
+    selected_labels: set[str],
+    preserved_values: set[str],
+) -> tuple[SpanForReplacement, ...]:
+    protected_ranges = _structural_timestamp_ranges(text)
+    return tuple(
+        span
+        for span in spans
+        if span.label in selected_labels
+        and not _is_protected_structural_timestamp_span(span, protected_ranges)
+        and not _is_preserved_value_span(text, span, preserved_values)
+    )
+
+
+def _structural_timestamp_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        match.span("timestamp_token")
+        for match in _STRUCTURAL_TIMESTAMP_HEADER_PATTERN.finditer(text)
+    )
+
+
+def _is_protected_structural_timestamp_span(
+    span: SpanForReplacement,
+    protected_ranges: Sequence[tuple[int, int]],
+) -> bool:
+    if span.label != "private_date":
+        return False
+    return any(
+        span.start < protected_end and protected_start < span.end
+        for protected_start, protected_end in protected_ranges
+    )
+
+
+def _is_preserved_value_span(
+    text: str,
+    span: SpanForReplacement,
+    preserved_values: set[str],
+) -> bool:
+    if not preserved_values or span.start < 0 or span.end > len(text):
+        return False
+    span_text = text[span.start : span.end]
+    return _normalize_preserved_value(span_text) in preserved_values
+
+
+def _normalized_preserved_value_set(values: Iterable[str]) -> set[str]:
+    return {
+        normalized
+        for value in values
+        if (normalized := _normalize_preserved_value(str(value)))
+    }
+
+
+def _normalize_preserved_value(value: str) -> str:
+    return value.strip().casefold()
 
 
 def _coerce_spans(spans: Iterable[object]) -> tuple[SpanForReplacement, ...]:

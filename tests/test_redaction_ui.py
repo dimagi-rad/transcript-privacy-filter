@@ -4,8 +4,10 @@ from dataclasses import dataclass
 import zipfile
 from io import BytesIO
 
+from docx import Document
+
 from opf_app.models import ParsedItem
-from opf_app.redaction import SpanForReplacement
+from opf_app.redaction import SpanForReplacement, parse_preserved_values
 from opf_app.ui import (
     category_state_keys,
     run_redaction_for_ui,
@@ -25,11 +27,27 @@ class FakeRedactor:
     def redact(self, text: str) -> FakeOpfResult:
         if text == "fail":
             raise RuntimeError("planned failure")
-        spans = (
-            (SpanForReplacement("private_person", 0, 5, "<PRIVATE_PERSON>"),)
-            if text.startswith("Alice")
-            else ()
-        )
+        spans: list[SpanForReplacement] = []
+        if "Alice" in text:
+            start = text.index("Alice")
+            spans.append(
+                SpanForReplacement(
+                    "private_person",
+                    start,
+                    start + len("Alice"),
+                    "<PRIVATE_PERSON>",
+                )
+            )
+        if "Suzy" in text:
+            start = text.index("Suzy")
+            spans.append(
+                SpanForReplacement(
+                    "private_person",
+                    start,
+                    start + len("Suzy"),
+                    "<PRIVATE_PERSON>",
+                )
+            )
         return FakeOpfResult(text=text, detected_spans=spans)
 
 
@@ -46,6 +64,13 @@ def test_category_control_state_helpers() -> None:
     assert selected_categories_from_state(labels, state) == ("private_person",)
 
 
+def test_preserved_values_parser_for_ui_text_input() -> None:
+    assert parse_preserved_values("Suzy, https://example.test, suzy") == (
+        "Suzy",
+        "https://example.test",
+    )
+
+
 def test_run_redaction_for_ui_with_fake_redactor_produces_zip_and_rows() -> None:
     outcome = run_redaction_for_ui(
         (
@@ -53,6 +78,7 @@ def test_run_redaction_for_ui_with_fake_redactor_produces_zip_and_rows() -> None
             _item("two", "fail"),
         ),
         selected_labels=("private_person",),
+        preserved_values=(),
         concurrency=2,
         redactor=FakeRedactor(),
     )
@@ -69,6 +95,23 @@ def test_run_redaction_for_ui_with_fake_redactor_produces_zip_and_rows() -> None
         assert archive.namelist() == [
             "redacted-transcript-2026-05-11-one.docx"
         ]
+
+
+def test_run_redaction_for_ui_preserves_values_in_generated_output() -> None:
+    outcome = run_redaction_for_ui(
+        (_item("chatbot", "Alice asked Suzy."),),
+        selected_labels=("private_person",),
+        preserved_values=("suzy",),
+        concurrency=1,
+        redactor=FakeRedactor(),
+    )
+
+    assert outcome.result_rows[0]["Selected redactions"] == 1
+    with zipfile.ZipFile(BytesIO(outcome.zip_bytes)) as archive:
+        docx_bytes = archive.read("redacted-transcript-2026-05-11-chatbot.docx")
+    document = Document(BytesIO(docx_bytes))
+    paragraphs = [paragraph.text for paragraph in document.paragraphs]
+    assert "<PRIVATE_PERSON> asked Suzy." in paragraphs
 
 
 def _item(identifier: str, body_text: str) -> ParsedItem:
