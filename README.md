@@ -12,6 +12,7 @@ Repository resources: [License](LICENSE) and [Security Policy](SECURITY.md).
 - Parses uploaded document folders/files, or an advanced local folder path, for supported documents: `.txt`, `.docx`, `.doc`, and embedded-text `.pdf`.
 - Shows a review table with inferred date, identifier, parse status, and output filename preview.
 - Lets users choose which OPF privacy categories should be redacted.
+- Lets users keep known literal values unredacted with an optional comma-separated list.
 - Lets users set `Parallel redaction jobs` from `1` to `8`.
 - Generates one plain `.docx` file per successful item.
 - Formats transcript speaker labels in generated `.docx` files for easier review.
@@ -74,6 +75,8 @@ For document transcripts, the parser can infer dates and identifiers from filena
 ## Redaction Controls
 
 Category selection defaults to all available OPF labels. If a category is unchecked, spans detected for that category are left unchanged in the generated output.
+
+`Values to keep unredacted` accepts an optional comma-separated list of literal values that should stay unchanged even when OPF detects them in a selected category. Matching is case-insensitive and applies across detected categories, so users can preserve known non-sensitive names such as chatbot display names, as well as URLs, dates, IDs, or custom-category values.
 
 `Parallel redaction jobs` controls how many parsed sessions or documents are submitted at the same time. The app clamps this value to `1` through `8` and uses `2` by default.
 
