@@ -13,6 +13,7 @@ from opf_app.redaction import (
     apply_selected_replacements,
     create_typed_opf_redactor,
     list_runtime_labels,
+    parse_preserved_values,
     redact_item,
     resolve_default_opf_device,
 )
@@ -99,6 +100,96 @@ def test_selecting_no_labels_leaves_text_unchanged() -> None:
     assert result.redacted_text == item.body_text
     assert result.detected_span_count == 2
     assert result.selected_span_count == 0
+
+
+def test_parse_preserved_values_trims_blanks_and_deduplicates() -> None:
+    assert parse_preserved_values(" Suzy, , suzy, Chatbot,CHATBOT ") == (
+        "Suzy",
+        "Chatbot",
+    )
+
+
+def test_preserved_person_value_stays_unredacted() -> None:
+    item = _item("Suzy greeted Alice.")
+    spans = (
+        SpanForReplacement("private_person", 0, 4, "<PRIVATE_PERSON>"),
+        SpanForReplacement("private_person", 13, 18, "<PRIVATE_PERSON>"),
+    )
+
+    result = redact_item(
+        item,
+        FakeRedactor(text=item.body_text, spans=spans),
+        selected_labels=["private_person"],
+        preserved_values=["suzy"],
+    )
+
+    assert result.redacted_text == "Suzy greeted <PRIVATE_PERSON>."
+    assert result.detected_span_count == 2
+    assert result.selected_span_count == 1
+    assert result.selected_counts_by_label == {"private_person": 1}
+
+
+def test_preserved_values_apply_to_non_person_categories() -> None:
+    item = _item("Alice emailed team@example.test.")
+    spans = (
+        SpanForReplacement("private_person", 0, 5, "<PRIVATE_PERSON>"),
+        SpanForReplacement("private_email", 14, 31, "<PRIVATE_EMAIL>"),
+    )
+
+    result = redact_item(
+        item,
+        FakeRedactor(text=item.body_text, spans=spans),
+        selected_labels=["private_person", "private_email"],
+        preserved_values=["TEAM@example.test"],
+    )
+
+    assert result.redacted_text == "<PRIVATE_PERSON> emailed team@example.test."
+    assert result.selected_counts_by_label == {"private_person": 1}
+
+
+def test_private_date_redaction_preserves_structural_timestamp_prefix() -> None:
+    text = "[00:00] S1: Alice spoke on 2026-05-17."
+    item = _item(text)
+    timestamp_start = text.index("00:00")
+    person_start = text.index("Alice")
+    date_start = text.index("2026-05-17")
+    spans = (
+        SpanForReplacement(
+            "private_date",
+            timestamp_start,
+            timestamp_start + len("00:00"),
+            "<PRIVATE_DATE>",
+        ),
+        SpanForReplacement(
+            "private_person",
+            person_start,
+            person_start + len("Alice"),
+            "<PRIVATE_PERSON>",
+        ),
+        SpanForReplacement(
+            "private_date",
+            date_start,
+            date_start + len("2026-05-17"),
+            "<PRIVATE_DATE>",
+        ),
+    )
+
+    result = redact_item(
+        item,
+        FakeRedactor(text=item.body_text, spans=spans),
+        selected_labels=["private_date", "private_person"],
+    )
+
+    assert (
+        result.redacted_text
+        == "[00:00] S1: <PRIVATE_PERSON> spoke on <PRIVATE_DATE>."
+    )
+    assert result.detected_span_count == 3
+    assert result.selected_span_count == 2
+    assert result.selected_counts_by_label == {
+        "private_date": 1,
+        "private_person": 1,
+    }
 
 
 def test_adjacent_and_non_overlapping_spans_use_typed_placeholders() -> None:

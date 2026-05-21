@@ -13,7 +13,12 @@ from .batch import BatchResult, clamp_concurrency, run_redaction_batch
 from .documents import SUPPORTED_DOCUMENT_EXTENSIONS, parse_document
 from .models import ParsedItem
 from .ocs_csv import OcsCsvValidationError, parse_ocs_csv_text
-from .redaction import DEFAULT_RUNTIME_LABELS, RedactionService, RedactorLike
+from .redaction import (
+    DEFAULT_RUNTIME_LABELS,
+    RedactionService,
+    RedactorLike,
+    parse_preserved_values,
+)
 
 
 CSV_MODE = "OCS CSV export"
@@ -27,6 +32,7 @@ REDACTION_RESULT_ROWS_STATE_KEY = "redaction_result_rows"
 REDACTION_FAILED_ROWS_STATE_KEY = "redaction_failed_rows"
 REDACTION_PROGRESS_STATE_KEY = "redaction_progress"
 DOCUMENT_FOLDER_PATH_STATE_KEY = "document_folder_path"
+PRESERVED_VALUES_STATE_KEY = "preserved_values"
 CATEGORY_STATE_PREFIX = "category_"
 SUPPORTED_UPLOAD_TYPES = tuple(
     extension.removeprefix(".") for extension in sorted(SUPPORTED_DOCUMENT_EXTENSIONS)
@@ -200,6 +206,7 @@ def run_redaction_for_ui(
     items: tuple[ParsedItem, ...] | list[ParsedItem],
     *,
     selected_labels: tuple[str, ...] | list[str],
+    preserved_values: tuple[str, ...] | list[str] = (),
     concurrency: int,
     redactor: RedactorLike | None = None,
 ) -> RedactionUiOutcome:
@@ -209,6 +216,7 @@ def run_redaction_for_ui(
         batch_result = run_redaction_batch(
             tuple(items),
             selected_labels=tuple(selected_labels),
+            preserved_values=tuple(preserved_values),
             redaction_service=RedactionService(redactor),
             output_dir=tmpdir,
             concurrency=concurrency,
@@ -314,6 +322,7 @@ def _ensure_session_state() -> None:
     st.session_state.setdefault(REDACTION_FAILED_ROWS_STATE_KEY, ())
     st.session_state.setdefault(REDACTION_PROGRESS_STATE_KEY, ())
     st.session_state.setdefault(DOCUMENT_FOLDER_PATH_STATE_KEY, "")
+    st.session_state.setdefault(PRESERVED_VALUES_STATE_KEY, "")
 
 
 def _store_parse_outcome(outcome: ParseOutcome) -> None:
@@ -412,6 +421,16 @@ def _render_redaction_controls() -> None:
             st.checkbox(label, key=keys[label])
 
     selected_labels = selected_categories_from_state(labels, st.session_state)
+    preserved_values_text = st.text_input(
+        "Values to keep unredacted",
+        key=PRESERVED_VALUES_STATE_KEY,
+        placeholder="Optional comma-separated values",
+        help=(
+            "Detected spans that exactly match one of these values stay unchanged, "
+            "even when their category is selected."
+        ),
+    )
+    preserved_values = parse_preserved_values(preserved_values_text)
     concurrency = st.number_input(
         "Parallel redaction jobs",
         min_value=1,
@@ -431,6 +450,7 @@ def _render_redaction_controls() -> None:
             outcome = run_redaction_for_ui(
                 items,
                 selected_labels=selected_labels,
+                preserved_values=preserved_values,
                 concurrency=clamp_concurrency(int(concurrency)),
             )
         status.success("Redaction run complete.")
