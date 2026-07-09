@@ -17,6 +17,9 @@ _TRANSCRIPT_LINE_RE = re.compile(
     r"(?P<separator>:\s*)"
     r"(?P<body>.*)$"
 )
+_XML_INVALID_CHARACTER_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
+)
 V2_WORKFLOW_LABEL = "OpenAI Responses API v2"
 
 
@@ -161,22 +164,26 @@ def _write_redacted_docx(
     document = Document()
     document.add_heading("Redacted Transcript", level=1)
     if workflow_label:
-        document.add_paragraph(f"Redaction workflow: {workflow_label}")
+        document.add_paragraph(_xml_safe_text(f"Redaction workflow: {workflow_label}"))
     if include_source:
-        document.add_paragraph(f"Source: {result.item.source_name}")
-    document.add_paragraph(f"Chat date: {result.item.chat_date}")
-    document.add_paragraph(f"User identifier: {result.item.user_identifier}")
+        document.add_paragraph(_xml_safe_text(f"Source: {result.item.source_name}"))
+    document.add_paragraph(_xml_safe_text(f"Chat date: {result.item.chat_date}"))
+    document.add_paragraph(
+        _xml_safe_text(f"User identifier: {result.item.user_identifier}")
+    )
     if result.item.session_id:
-        document.add_paragraph(f"Session ID: {result.item.session_id}")
+        document.add_paragraph(_xml_safe_text(f"Session ID: {result.item.session_id}"))
 
     document.add_paragraph("")
-    for line in result.redacted_text.splitlines() or [""]:
+    redacted_text = _xml_safe_text(result.redacted_text)
+    for line in redacted_text.splitlines() or [""]:
         _add_body_paragraph(document, line)
 
     document.save(output_path)
 
 
 def _add_body_paragraph(document: Document, line: str) -> None:
+    line = _xml_safe_text(line)
     match = _TRANSCRIPT_LINE_RE.match(line)
     if match is None:
         document.add_paragraph(line)
@@ -187,6 +194,11 @@ def _add_body_paragraph(document: Document, line: str) -> None:
     speaker_run = paragraph.add_run(f"{match.group('speaker').upper()}:")
     speaker_run.bold = True
     paragraph.add_run(match.group("separator")[1:] + match.group("body"))
+
+
+def _xml_safe_text(text: str) -> str:
+    """Remove code points that cannot be serialized as XML 1.0 text."""
+    return _XML_INVALID_CHARACTER_RE.sub("", text)
 
 
 def _unique_filename(result: RedactionResult, used_filenames: set[str]) -> str:
