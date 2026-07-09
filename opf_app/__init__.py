@@ -1,4 +1,4 @@
-"""Local Streamlit app package for OPF redaction workflows."""
+"""Local Streamlit app package for Responses API redaction workflows."""
 
 APP_TITLE = "Privacy Filter Redaction"
 

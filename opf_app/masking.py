@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 import re
 from typing import Literal
 
-from .redaction import parse_preserved_values
 from .sentences import SentenceUnit
 
 
@@ -91,6 +90,20 @@ class _PreserveMatch:
     start: int
     end: int
     original_text: str = field(repr=False)
+
+
+def parse_preserved_values(raw_values: str) -> tuple[str, ...]:
+    """Parse comma-separated preserve values without loading the legacy OPF path."""
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values.split(","):
+        value = raw_value.strip()
+        normalized = value.casefold()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(value)
+    return tuple(values)
 
 
 def format_mask_token(mask_number: int) -> str:

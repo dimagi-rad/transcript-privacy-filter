@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,7 +9,6 @@ import time
 import zipfile
 
 from docx import Document
-import pytest
 
 from tests.fixtures import write_sample_docx, write_sample_ocs_csv
 from opf_app.batch import run_redaction_batch
@@ -245,32 +243,6 @@ def test_streamlit_startup_smoke() -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=10)
-
-
-def _opf_checkpoint_available() -> bool:
-    checkpoint = Path(
-        os.environ.get("OPF_CHECKPOINT", str(Path.home() / ".opf" / "privacy_filter"))
-    ).expanduser()
-    return (
-        checkpoint.is_dir()
-        and (checkpoint / "config.json").is_file()
-        and any(checkpoint.glob("*.safetensors"))
-    )
-
-
-@pytest.mark.skipif(
-    not _opf_checkpoint_available(),
-    reason="OPF checkpoint not available locally; skipping real model smoke.",
-)
-def test_optional_real_opf_smoke_when_checkpoint_available() -> None:
-    from opf import OPF
-
-    checkpoint = os.environ.get("OPF_CHECKPOINT") or str(
-        Path.home() / ".opf" / "privacy_filter"
-    )
-    result = OPF(model=checkpoint, device="cpu", output_mode="typed").redact("Alice")
-
-    assert hasattr(result, "detected_spans")
 
 
 def _item(identifier: str, body_text: str) -> ParsedItem:

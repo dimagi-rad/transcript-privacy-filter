@@ -4,17 +4,8 @@ from dataclasses import dataclass
 import zipfile
 from io import BytesIO
 
-from docx import Document
-
 from opf_app.models import ParsedItem, RedactionResult
-from opf_app.redaction import SpanForReplacement, parse_preserved_values
-from opf_app.ui import (
-    category_state_keys,
-    run_redaction_for_ui,
-    run_v2_redaction_for_ui,
-    selected_categories_from_state,
-    set_category_selection_state,
-)
+from opf_app.ui import run_v2_redaction_for_ui
 from opf_app.v2_redaction import (
     V2ChunkMetadata,
     V2RedactionErrorCategory,
@@ -22,104 +13,6 @@ from opf_app.v2_redaction import (
     V2RedactionServiceResult,
     V2UsageTotals,
 )
-
-
-@dataclass(frozen=True)
-class FakeOpfResult:
-    text: str
-    detected_spans: tuple[SpanForReplacement, ...]
-    warning: str | None = None
-
-
-class FakeRedactor:
-    def redact(self, text: str) -> FakeOpfResult:
-        if text == "fail":
-            raise RuntimeError("planned failure")
-        spans: list[SpanForReplacement] = []
-        if "Alice" in text:
-            start = text.index("Alice")
-            spans.append(
-                SpanForReplacement(
-                    "private_person",
-                    start,
-                    start + len("Alice"),
-                    "<PRIVATE_PERSON>",
-                )
-            )
-        if "Suzy" in text:
-            start = text.index("Suzy")
-            spans.append(
-                SpanForReplacement(
-                    "private_person",
-                    start,
-                    start + len("Suzy"),
-                    "<PRIVATE_PERSON>",
-                )
-            )
-        return FakeOpfResult(text=text, detected_spans=spans)
-
-
-def test_category_control_state_helpers() -> None:
-    labels = ("private_person", "private_email")
-    state: dict[str, object] = {}
-
-    assert selected_categories_from_state(labels, state) == labels
-
-    set_category_selection_state(labels, state, selected=False)
-    assert selected_categories_from_state(labels, state) == ()
-
-    state[category_state_keys(labels)["private_person"]] = True
-    assert selected_categories_from_state(labels, state) == ("private_person",)
-
-
-def test_preserved_values_parser_for_ui_text_input() -> None:
-    assert parse_preserved_values("Suzy, https://example.test, suzy") == (
-        "Suzy",
-        "https://example.test",
-    )
-
-
-def test_run_redaction_for_ui_with_fake_redactor_produces_zip_and_rows() -> None:
-    outcome = run_redaction_for_ui(
-        (
-            _item("one", "Alice"),
-            _item("two", "fail"),
-        ),
-        selected_labels=("private_person",),
-        preserved_values=(),
-        concurrency=2,
-        redactor=FakeRedactor(),
-    )
-
-    assert outcome.total_count == 2
-    assert outcome.complete_count == 1
-    assert outcome.failed_count == 1
-    assert outcome.failed_rows
-    assert any(
-        message.startswith("Now redacting document")
-        for message in outcome.progress_messages
-    )
-    with zipfile.ZipFile(BytesIO(outcome.zip_bytes)) as archive:
-        assert archive.namelist() == [
-            "redacted-transcript-2026-05-11-one.docx"
-        ]
-
-
-def test_run_redaction_for_ui_preserves_values_in_generated_output() -> None:
-    outcome = run_redaction_for_ui(
-        (_item("chatbot", "Alice asked Suzy."),),
-        selected_labels=("private_person",),
-        preserved_values=("suzy",),
-        concurrency=1,
-        redactor=FakeRedactor(),
-    )
-
-    assert outcome.result_rows[0]["Selected redactions"] == 1
-    with zipfile.ZipFile(BytesIO(outcome.zip_bytes)) as archive:
-        docx_bytes = archive.read("redacted-transcript-2026-05-11-chatbot.docx")
-    document = Document(BytesIO(docx_bytes))
-    paragraphs = [paragraph.text for paragraph in document.paragraphs]
-    assert "<PRIVATE_PERSON> asked Suzy." in paragraphs
 
 
 def test_run_v2_redaction_for_ui_uses_config_and_privacy_safe_summary() -> None:
