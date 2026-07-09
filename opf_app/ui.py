@@ -10,6 +10,16 @@ import streamlit as st
 
 from . import APP_TITLE
 from .batch import BatchResult, clamp_concurrency, run_redaction_batch
+from .config import (
+    API_CONCURRENCY_RANGE,
+    RETRY_ATTEMPTS_DEFAULT,
+    SENTENCE_CHUNK_RANGE,
+    SESSION_API_KEY_STATE_KEY,
+    V2_MODEL_CATALOG,
+    ApiKeyCredential,
+    resolve_api_key,
+    resolve_model_id,
+)
 from .documents import SUPPORTED_DOCUMENT_EXTENSIONS, parse_document
 from .models import ParsedItem
 from .ocs_csv import OcsCsvValidationError, parse_ocs_csv_text
@@ -19,6 +29,15 @@ from .redaction import (
     RedactorLike,
     parse_preserved_values,
 )
+from .responses_client import ResponsesRedactionClient
+from .v2_batch import (
+    V2BatchResult,
+    V2RedactionServiceLike,
+    clamp_v2_api_concurrency,
+    clamp_v2_sentence_chunk_size,
+    run_v2_redaction_batch,
+)
+from .v2_redaction import V2RedactionService
 
 
 CSV_MODE = "OCS CSV export"
@@ -33,6 +52,10 @@ REDACTION_FAILED_ROWS_STATE_KEY = "redaction_failed_rows"
 REDACTION_PROGRESS_STATE_KEY = "redaction_progress"
 DOCUMENT_FOLDER_PATH_STATE_KEY = "document_folder_path"
 PRESERVED_VALUES_STATE_KEY = "preserved_values"
+V2_MODEL_STATE_KEY = "v2_model_id"
+V2_CUSTOM_MODEL_STATE_KEY = "v2_custom_model_id"
+V2_SENTENCE_CHUNK_SIZE_STATE_KEY = "v2_sentence_chunk_size"
+V2_API_CONCURRENCY_STATE_KEY = "v2_api_concurrency"
 CATEGORY_STATE_PREFIX = "category_"
 SUPPORTED_UPLOAD_TYPES = tuple(
     extension.removeprefix(".") for extension in sorted(SUPPORTED_DOCUMENT_EXTENSIONS)
@@ -53,6 +76,18 @@ class RedactionUiOutcome:
     complete_count: int
     failed_count: int
     zip_bytes: bytes
+    result_rows: tuple[dict[str, object], ...]
+    failed_rows: tuple[dict[str, str], ...]
+    progress_messages: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class V2RedactionUiOutcome:
+    total_count: int
+    complete_count: int
+    failed_count: int
+    zip_bytes: bytes
+    summary: dict[str, object]
     result_rows: tuple[dict[str, object], ...]
     failed_rows: tuple[dict[str, str], ...]
     progress_messages: tuple[str, ...]
@@ -238,6 +273,54 @@ def run_redaction_for_ui(
     )
 
 
+def run_v2_redaction_for_ui(
+    items: tuple[ParsedItem, ...] | list[ParsedItem],
+    *,
+    api_key: str = "",
+    model_id: str,
+    sentence_chunk_size: int,
+    api_concurrency: int,
+    preserved_values: tuple[str, ...] | list[str] = (),
+    retry_limit: int = RETRY_ATTEMPTS_DEFAULT,
+    redaction_service: V2RedactionServiceLike | None = None,
+) -> V2RedactionUiOutcome:
+    """Run v2 redaction and return only privacy-safe UI data."""
+    service = redaction_service
+    if service is None:
+        service = V2RedactionService(
+            ResponsesRedactionClient(api_key=api_key),
+        )
+
+    progress_messages: list[str] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        batch_result = run_v2_redaction_batch(
+            tuple(items),
+            model_id=model_id,
+            redaction_service=service,
+            output_dir=tmpdir,
+            sentence_chunk_size=sentence_chunk_size,
+            api_concurrency=api_concurrency,
+            retry_limit=retry_limit,
+            preserved_values=tuple(preserved_values),
+            progress_callback=lambda event: progress_messages.append(event.message),
+        )
+        zip_bytes = batch_result.zip_path.read_bytes()
+        result_rows = tuple(prepare_v2_redaction_result_rows(batch_result))
+        failed_rows = tuple(prepare_v2_failed_redaction_rows(batch_result))
+        summary = prepare_v2_run_summary(batch_result)
+
+    return V2RedactionUiOutcome(
+        total_count=batch_result.total_count,
+        complete_count=batch_result.complete_count,
+        failed_count=batch_result.failed_count,
+        zip_bytes=zip_bytes,
+        summary=summary,
+        result_rows=result_rows,
+        failed_rows=failed_rows,
+        progress_messages=tuple(progress_messages),
+    )
+
+
 def prepare_redaction_result_rows(batch_result: BatchResult) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for item_result in batch_result.items:
@@ -247,6 +330,24 @@ def prepare_redaction_result_rows(batch_result: BatchResult) -> list[dict[str, o
                 "Status": item_result.status,
                 "Detected spans": item_result.redaction_result.detected_span_count,
                 "Selected redactions": item_result.redaction_result.selected_span_count,
+                "Output filename": item_result.output.filename,
+            }
+        )
+    return rows
+
+
+def prepare_v2_redaction_result_rows(
+    batch_result: V2BatchResult,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item_result in batch_result.items:
+        rows.append(
+            {
+                "Item name": item_result.item.item_name,
+                "Status": item_result.status,
+                "Sentences": item_result.metadata.total_sentence_count,
+                "Chunks": item_result.metadata.chunk_count,
+                "Retries": item_result.metadata.retry_count,
                 "Output filename": item_result.output.filename,
             }
         )
@@ -267,6 +368,53 @@ def prepare_failed_redaction_rows(batch_result: BatchResult) -> list[dict[str, s
                 }
             )
     return rows
+
+
+def prepare_v2_failed_redaction_rows(
+    batch_result: V2BatchResult,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item_result in batch_result.failed_items:
+        categories = ", ".join(item_result.metadata.error_categories) or "unknown"
+        errors = (
+            item_result.redaction_result.errors
+            or item_result.output.errors
+            or (f"v2_redaction_failed:{categories}",)
+        )
+        for error in errors:
+            rows.append(
+                {
+                    "Item name": item_result.item.item_name,
+                    "Output filename": item_result.output.filename,
+                    "Error category": categories,
+                    "Error": error,
+                }
+            )
+    return rows
+
+
+def prepare_v2_run_summary(batch_result: V2BatchResult) -> dict[str, object]:
+    summary = batch_result.summary
+    usage = summary.usage.summary()
+    return {
+        "model_id": summary.model_id,
+        "sentence_chunk_size": summary.sentence_chunk_size,
+        "api_concurrency": summary.api_concurrency,
+        "retry_limit": summary.retry_limit,
+        "total_count": summary.total_item_count,
+        "complete_count": summary.complete_item_count,
+        "failed_count": summary.failed_item_count,
+        "total_sentence_count": summary.total_sentence_count,
+        "successful_chunk_count": summary.successful_chunk_count,
+        "failed_chunk_count": summary.failed_chunk_count,
+        "retry_count": summary.retry_count,
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "total_tokens": usage["total_tokens"],
+        "cached_input_tokens": usage["cached_input_tokens"],
+        "reasoning_output_tokens": usage["reasoning_output_tokens"],
+        "error_categories": summary.error_categories,
+    }
 
 
 def render_app() -> None:
@@ -323,6 +471,8 @@ def _ensure_session_state() -> None:
     st.session_state.setdefault(REDACTION_PROGRESS_STATE_KEY, ())
     st.session_state.setdefault(DOCUMENT_FOLDER_PATH_STATE_KEY, "")
     st.session_state.setdefault(PRESERVED_VALUES_STATE_KEY, "")
+    st.session_state.setdefault(SESSION_API_KEY_STATE_KEY, "")
+    st.session_state.setdefault(V2_CUSTOM_MODEL_STATE_KEY, "")
 
 
 def _store_parse_outcome(outcome: ParseOutcome) -> None:
@@ -397,64 +547,129 @@ def _render_redaction_controls() -> None:
     if not items:
         return
 
-    labels = DEFAULT_RUNTIME_LABELS
-    _ensure_category_state(labels)
-
     st.subheader("Redaction")
     st.caption(
-        "Unselected categories are left unchanged even when the privacy filter "
-        "detects them. OPF is a redaction aid and may miss or over-redact spans."
+        "OpenAI Responses API v2 redacts sentence batches after local parsing "
+        "and masking. Review generated outputs before using them as final."
     )
 
-    select_column, clear_column = st.columns(2)
-    with select_column:
-        if st.button("Select all categories"):
-            set_category_selection_state(labels, st.session_state, selected=True)
-    with clear_column:
-        if st.button("Clear all categories"):
-            set_category_selection_state(labels, st.session_state, selected=False)
+    _render_api_key_controls()
+    selected_model_id = _render_model_controls()
 
-    checkbox_columns = st.columns(2)
-    keys = category_state_keys(labels)
-    for index, label in enumerate(labels):
-        with checkbox_columns[index % 2]:
-            st.checkbox(label, key=keys[label])
-
-    selected_labels = selected_categories_from_state(labels, st.session_state)
     preserved_values_text = st.text_input(
         "Values to keep unredacted",
         key=PRESERVED_VALUES_STATE_KEY,
         placeholder="Optional comma-separated values",
         help=(
-            "Detected spans that exactly match one of these values stay unchanged, "
-            "even when their category is selected."
+            "Values are masked locally before API submission and restored after "
+            "validated output. They are not shown in summaries."
         ),
     )
     preserved_values = parse_preserved_values(preserved_values_text)
-    concurrency = st.number_input(
-        "Parallel redaction jobs",
-        min_value=1,
-        max_value=8,
-        value=2,
-        step=1,
-        help=(
-            "Controls how many parsed sessions/documents are submitted to the "
-            "privacy filter at the same time."
-        ),
-    )
+    throughput_column, concurrency_column = st.columns(2)
+    with throughput_column:
+        sentence_chunk_size = st.number_input(
+            "Sentences per API call",
+            min_value=SENTENCE_CHUNK_RANGE.minimum,
+            max_value=SENTENCE_CHUNK_RANGE.maximum,
+            value=SENTENCE_CHUNK_RANGE.default,
+            step=1,
+            key=V2_SENTENCE_CHUNK_SIZE_STATE_KEY,
+            help="Controls how many masked sentences are sent in each API request.",
+        )
+    with concurrency_column:
+        api_concurrency = st.number_input(
+            "Parallel API calls",
+            min_value=API_CONCURRENCY_RANGE.minimum,
+            max_value=API_CONCURRENCY_RANGE.maximum,
+            value=API_CONCURRENCY_RANGE.default,
+            step=1,
+            key=V2_API_CONCURRENCY_STATE_KEY,
+            help="Controls how many API-backed item redactions can run at once.",
+        )
 
     if st.button("Run redaction", type="primary"):
+        credential = resolve_api_key(
+            session_api_key=str(st.session_state.get(SESSION_API_KEY_STATE_KEY, ""))
+        )
+        if not credential.is_configured:
+            st.error(
+                "OpenAI API key is not configured. Set OPENAI_API_KEY or enter a "
+                "session-only key."
+            )
+            return
+
+        try:
+            model_id = resolve_model_id(
+                selected_model_id=selected_model_id,
+                custom_model_id=str(
+                    st.session_state.get(V2_CUSTOM_MODEL_STATE_KEY, "")
+                ),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
         status = st.empty()
-        status.info("Running local redaction...")
-        with st.spinner("Processing parsed items locally"):
-            outcome = run_redaction_for_ui(
+        status.info("Running v2 redaction...")
+        with st.spinner("Processing parsed items with the Responses API"):
+            outcome = run_v2_redaction_for_ui(
                 items,
-                selected_labels=selected_labels,
+                api_key=credential.require_value(),
+                model_id=model_id,
+                sentence_chunk_size=clamp_v2_sentence_chunk_size(
+                    int(sentence_chunk_size)
+                ),
+                api_concurrency=clamp_v2_api_concurrency(int(api_concurrency)),
                 preserved_values=preserved_values,
-                concurrency=clamp_concurrency(int(concurrency)),
             )
         status.success("Redaction run complete.")
-        _store_redaction_outcome(outcome)
+        _store_v2_redaction_outcome(outcome)
+
+
+def _render_api_key_controls() -> ApiKeyCredential:
+    credential = resolve_api_key(
+        session_api_key=str(st.session_state.get(SESSION_API_KEY_STATE_KEY, ""))
+    )
+    if credential.source == "environment":
+        st.success("OpenAI API key configured from environment.")
+        return credential
+
+    session_api_key = st.text_input(
+        "OpenAI API key",
+        type="password",
+        key=SESSION_API_KEY_STATE_KEY,
+        help="Stored only in this Streamlit session; never written to app outputs.",
+    )
+    credential = resolve_api_key(session_api_key=session_api_key)
+    if credential.is_configured:
+        st.success("OpenAI API key configured for this session.")
+    else:
+        st.warning("OpenAI API key is required before running v2 redaction.")
+    return credential
+
+
+def _render_model_controls() -> str:
+    labels_by_id = {
+        option.model_id: f"{option.display_label} ({option.model_id})"
+        for option in V2_MODEL_CATALOG
+    }
+    model_ids = tuple(labels_by_id)
+    selected_model_id = st.selectbox(
+        "Model",
+        options=model_ids,
+        index=0,
+        format_func=lambda model_id: labels_by_id[model_id],
+        key=V2_MODEL_STATE_KEY,
+        help="Choose a configured model, or enter a custom model ID below.",
+    )
+    st.text_input(
+        "Custom model ID",
+        key=V2_CUSTOM_MODEL_STATE_KEY,
+        placeholder="Optional model override",
+        help="Overrides the configured model dropdown when provided.",
+    )
+    return str(selected_model_id)
 
 
 def _ensure_category_state(labels: tuple[str, ...]) -> None:
@@ -474,6 +689,14 @@ def _store_redaction_outcome(outcome: RedactionUiOutcome) -> None:
     st.session_state[REDACTION_PROGRESS_STATE_KEY] = outcome.progress_messages
 
 
+def _store_v2_redaction_outcome(outcome: V2RedactionUiOutcome) -> None:
+    st.session_state[ZIP_BYTES_STATE_KEY] = outcome.zip_bytes
+    st.session_state[REDACTION_SUMMARY_STATE_KEY] = outcome.summary
+    st.session_state[REDACTION_RESULT_ROWS_STATE_KEY] = outcome.result_rows
+    st.session_state[REDACTION_FAILED_ROWS_STATE_KEY] = outcome.failed_rows
+    st.session_state[REDACTION_PROGRESS_STATE_KEY] = outcome.progress_messages
+
+
 def _render_redaction_results() -> None:
     summary = st.session_state[REDACTION_SUMMARY_STATE_KEY]
     if not summary:
@@ -484,6 +707,24 @@ def _render_redaction_results() -> None:
     total_column.metric("Total items", summary["total_count"])
     complete_column.metric("Complete", summary["complete_count"])
     failed_column.metric("Failed", summary["failed_count"])
+
+    if "model_id" in summary:
+        model_column, sentence_column, chunk_column, retry_column = st.columns(4)
+        model_column.metric("Model", summary["model_id"])
+        sentence_column.metric("Sentences", summary["total_sentence_count"])
+        chunk_column.metric(
+            "Chunks",
+            (
+                f"{summary['successful_chunk_count']} complete / "
+                f"{summary['failed_chunk_count']} failed"
+            ),
+        )
+        retry_column.metric("Retries", summary["retry_count"])
+
+        token_column, input_column, output_column = st.columns(3)
+        token_column.metric("Total tokens", summary["total_tokens"])
+        input_column.metric("Input tokens", summary["input_tokens"])
+        output_column.metric("Output tokens", summary["output_tokens"])
 
     progress_messages = st.session_state[REDACTION_PROGRESS_STATE_KEY]
     if progress_messages:

@@ -13,7 +13,7 @@ from .config import (
     SENTENCE_CHUNK_RANGE,
 )
 from .models import ParsedItem, RedactionResult
-from .outputs import GeneratedOutput, OutputPackage, package_successful_outputs
+from .outputs import GeneratedOutput, OutputPackage, package_v2_successful_outputs
 from .v2_redaction import (
     V2RedactionErrorCategory,
     V2RedactionMetadata,
@@ -270,7 +270,10 @@ def run_v2_redaction_batch(
     ordered_redaction_results = tuple(
         result.redaction_result for result in ordered_results
     )
-    output_package = package_successful_outputs(ordered_redaction_results, output_dir)
+    output_package = package_v2_successful_outputs(
+        ordered_redaction_results,
+        output_dir,
+    )
     batch_items = tuple(
         V2BatchItemResult(
             item=service_result.redaction_result.item,

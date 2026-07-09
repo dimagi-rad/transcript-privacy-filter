@@ -6,7 +6,12 @@ import zipfile
 from docx import Document
 
 from opf_app.models import ParsedItem, RedactionResult
-from opf_app.outputs import generate_docx_output, package_successful_outputs
+from opf_app.outputs import (
+    generate_docx_output,
+    generate_v2_docx_output,
+    package_successful_outputs,
+    package_v2_successful_outputs,
+)
 
 
 def test_docx_output_contains_title_metadata_and_body(tmp_path: Path) -> None:
@@ -99,6 +104,51 @@ def test_failed_items_are_excluded_from_zip(tmp_path: Path) -> None:
     assert len(package.outputs) == 2
     assert len(package.successful_outputs) == 1
     assert len(package.failed_outputs) == 1
+    assert package.failed_outputs[0].path is None
+    with zipfile.ZipFile(package.zip_path) as archive:
+        assert archive.namelist() == [success.output_filename]
+
+
+def test_v2_docx_output_uses_minimal_metadata_without_source_name(
+    tmp_path: Path,
+) -> None:
+    result = _result(
+        source_name="sensitive-source-name.txt",
+        redacted_text="[2026-05-11 10:00:00+00:00] User: <PRIVATE_PERSON>",
+        session_id="session-1",
+    )
+
+    output = generate_v2_docx_output(result, tmp_path)
+
+    assert output.success is True
+    assert output.path is not None
+    paragraphs = _paragraphs(output.path)
+    assert "Redacted Transcript" in paragraphs
+    assert "Redaction workflow: OpenAI Responses API v2" in paragraphs
+    assert "Chat date: 2026-05-11" in paragraphs
+    assert "User identifier: user-1" in paragraphs
+    assert "Session ID: session-1" in paragraphs
+    assert "Source: sensitive-source-name.txt" not in paragraphs
+    assert "[2026-05-11 10:00:00+00:00] USER: <PRIVATE_PERSON>" in paragraphs
+
+
+def test_v2_zip_contains_only_successful_outputs_with_existing_filename_rules(
+    tmp_path: Path,
+) -> None:
+    success = _result(source_name="source-a.txt", redacted_text="redacted")
+    failed = _result(
+        source_name="source-b.txt",
+        redacted_text="original",
+        success=False,
+        errors=("v2_redaction_failed:rate_limit",),
+    )
+
+    package = package_v2_successful_outputs((success, failed), tmp_path)
+
+    assert len(package.outputs) == 2
+    assert len(package.successful_outputs) == 1
+    assert len(package.failed_outputs) == 1
+    assert package.successful_outputs[0].filename == success.output_filename
     assert package.failed_outputs[0].path is None
     with zipfile.ZipFile(package.zip_path) as archive:
         assert archive.namelist() == [success.output_filename]
