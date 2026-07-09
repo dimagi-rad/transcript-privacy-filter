@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 import zipfile
 from io import BytesIO
 
 from opf_app.models import ParsedItem, RedactionResult
-from opf_app.ui import run_v2_redaction_for_ui
+from opf_app.ui import _render_v2_live_progress, run_v2_redaction_for_ui
 from opf_app.v2_redaction import (
     V2ChunkMetadata,
     V2RedactionErrorCategory,
@@ -101,6 +102,40 @@ def test_run_v2_redaction_for_ui_reports_api_failures_without_source_text() -> N
         assert archive.namelist() == []
 
 
+def test_live_ui_progress_is_rendered_on_caller_thread_before_service_starts() -> None:
+    caller_thread_id = threading.get_ident()
+    plan_rendered = threading.Event()
+    progress_bar = FakeProgressBar()
+    status = FakeStatus()
+    service = PlanAwareFakeV2Service(plan_rendered=plan_rendered)
+
+    outcome = run_v2_redaction_for_ui(
+        (_item("chatbot", "Alice asked Suzy."),),
+        model_id="gpt-test-redactor",
+        sentence_chunk_size=1,
+        api_concurrency=1,
+        redaction_service=service,
+        progress_callback=lambda event: _render_and_ack_plan(
+            progress_bar,
+            status,
+            event,
+            plan_rendered,
+        ),
+    )
+
+    assert outcome.complete_count == 1
+    assert progress_bar.updates[0][0] == 0
+    assert progress_bar.updates[-1][0] == 100
+    assert "Estimating remaining time" in status.messages[0][0]
+    assert "about 0s" in status.messages[-1][0]
+    assert {
+        thread_id for _value, _text, thread_id in progress_bar.updates
+    } == {caller_thread_id}
+    assert {thread_id for _message, thread_id in status.messages} == {
+        caller_thread_id
+    }
+
+
 def _item(identifier: str, body_text: str) -> ParsedItem:
     return ParsedItem(
         item_name=identifier,
@@ -184,3 +219,46 @@ class FakeV2Service:
                 ),
             ),
         )
+
+
+@dataclass
+class PlanAwareFakeV2Service(FakeV2Service):
+    plan_rendered: threading.Event | None = None
+
+    def redact_item(self, item: ParsedItem, **kwargs: object) -> V2RedactionServiceResult:
+        assert self.plan_rendered is not None
+        assert self.plan_rendered.is_set()
+        kwargs.pop("progress_callback", None)
+        return super().redact_item(item, **kwargs)
+
+
+@dataclass
+class FakeProgressBar:
+    def __post_init__(self) -> None:
+        self.updates: list[tuple[int, str, int]] = []
+
+    def progress(self, value: int, *, text: str) -> None:
+        self.updates.append((value, text, threading.get_ident()))
+
+
+@dataclass
+class FakeStatus:
+    def __post_init__(self) -> None:
+        self.messages: list[tuple[str, int]] = []
+
+    def info(self, message: str) -> None:
+        self.messages.append((message, threading.get_ident()))
+
+
+def _render_and_ack_plan(
+    progress_bar: FakeProgressBar,
+    status: FakeStatus,
+    event: object,
+    plan_rendered: threading.Event,
+) -> None:
+    _render_v2_live_progress(progress_bar, status, event)
+    if event.event_type == "plan":
+        assert event.snapshot is not None
+        assert event.snapshot.percentage == 0
+        assert event.snapshot.total_chunk_count == 1
+        plan_rendered.set()

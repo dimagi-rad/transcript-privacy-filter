@@ -229,13 +229,48 @@ def test_v2_progress_events_are_privacy_safe(tmp_path: Path) -> None:
     )
 
     assert events == list(result.progress_events)
-    assert {event.event_type for event in events} == {"item", "chunk"}
+    assert {event.event_type for event in events} == {"plan", "item", "chunk"}
     progress_text = " ".join(event.message for event in events)
     assert "Alice" not in progress_text
     assert "private value" not in progress_text
     assert "<PRIVATE_PERSON>" not in progress_text
     assert "<SECRET>" not in progress_text
-    assert events[0].display_filename == "redacted-transcript-2026-05-11-user-0.docx"
+    assert any(
+        event.display_filename == "redacted-transcript-2026-05-11-user-0.docx"
+        for event in events
+    )
+
+
+def test_v2_progress_percentages_are_monotonic_with_out_of_order_completions(
+    tmp_path: Path,
+) -> None:
+    service = TrackingV2Service(
+        delays_by_item={
+            "item-0": 0.06,
+            "item-1": 0.01,
+            "item-2": 0.03,
+        }
+    )
+    events = []
+
+    result = run_v2_redaction_batch(
+        _items(3),
+        model_id="gpt-test-redactor",
+        redaction_service=service,
+        output_dir=tmp_path,
+        api_concurrency=3,
+        progress_callback=events.append,
+    )
+
+    percentages = [
+        event.snapshot.percentage
+        for event in events
+        if event.snapshot is not None
+    ]
+    assert percentages == sorted(percentages)
+    assert percentages[0] == 0
+    assert percentages[-1] == 100
+    assert result.final_progress.is_terminal is True
 
 
 def test_v2_batch_clamps_user_tunable_limits(tmp_path: Path) -> None:
