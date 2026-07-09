@@ -132,6 +132,40 @@ def test_v2_docx_output_uses_minimal_metadata_without_source_name(
     assert "[2026-05-11 10:00:00+00:00] USER: <PRIVATE_PERSON>" in paragraphs
 
 
+def test_v2_docx_output_removes_only_xml_invalid_characters(
+    tmp_path: Path,
+) -> None:
+    result = _result(
+        source_name="sensitive-source-name.txt",
+        redacted_text=(
+            "[00:00] User: café\x00before\x08after\x0bvalid\ttab\ufffe"
+        ),
+        session_id="session\x00-1",
+    )
+
+    output = generate_v2_docx_output(result, tmp_path)
+
+    assert output.success is True
+    assert output.path is not None
+    paragraphs = _paragraphs(output.path)
+    assert "Session ID: session-1" in paragraphs
+    assert "[00:00] USER: cafébeforeaftervalid\ttab" in paragraphs
+
+
+def test_docx_output_removes_xml_invalid_characters_from_source_metadata(
+    tmp_path: Path,
+) -> None:
+    result = _result(
+        source_name="example\x00-input.csv",
+        redacted_text="Plain readable body",
+    )
+
+    output = generate_docx_output(result, tmp_path)
+
+    assert output.path is not None
+    assert "Source: example-input.csv" in _paragraphs(output.path)
+
+
 def test_v2_zip_contains_only_successful_outputs_with_existing_filename_rules(
     tmp_path: Path,
 ) -> None:
