@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import threading
 import zipfile
 from io import BytesIO
 
 from opf_app.models import ParsedItem, RedactionResult
-from opf_app.ui import _render_v2_live_progress, run_v2_redaction_for_ui
+from opf_app.ui import (
+    MAX_VISIBLE_PROGRESS_MESSAGES,
+    _render_redaction_results,
+    _render_v2_live_progress,
+    prepare_progress_history_display,
+    run_v2_redaction_for_ui,
+)
 from opf_app.v2_redaction import (
     V2ChunkMetadata,
     V2RedactionErrorCategory,
@@ -134,6 +141,27 @@ def test_live_ui_progress_is_rendered_on_caller_thread_before_service_starts() -
     assert {thread_id for _message, thread_id in status.messages} == {
         caller_thread_id
     }
+
+
+def test_large_progress_history_is_bounded_to_recent_messages() -> None:
+    messages = tuple(f"privacy-safe progress {index}" for index in range(9_493))
+
+    visible_messages, omitted_count = prepare_progress_history_display(messages)
+
+    assert len(visible_messages) == MAX_VISIBLE_PROGRESS_MESSAGES
+    assert visible_messages == messages[-MAX_VISIBLE_PROGRESS_MESSAGES:]
+    assert omitted_count == 9_293
+    assert len(messages) == 9_493
+
+
+def test_download_control_renders_before_bounded_progress_history() -> None:
+    source = inspect.getsource(_render_redaction_results)
+
+    assert source.index("st.download_button(") < source.index(
+        'with st.expander("Progress messages")'
+    )
+    assert "for message in progress_messages" not in source
+    assert 'st.code("\\n".join(visible_messages)' in source
 
 
 def _item(identifier: str, body_text: str) -> ParsedItem:

@@ -58,6 +58,7 @@ V2_API_CONCURRENCY_STATE_KEY = "v2_api_concurrency"
 SUPPORTED_UPLOAD_TYPES = tuple(
     extension.removeprefix(".") for extension in sorted(SUPPORTED_DOCUMENT_EXTENSIONS)
 )
+MAX_VISIBLE_PROGRESS_MESSAGES = 200
 _UNSAFE_UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
 
 
@@ -372,6 +373,19 @@ def prepare_v2_run_summary(batch_result: V2BatchResult) -> dict[str, object]:
         "reasoning_output_tokens": usage["reasoning_output_tokens"],
         "error_categories": summary.error_categories,
     }
+
+
+def prepare_progress_history_display(
+    progress_messages: Sequence[str],
+    *,
+    limit: int = MAX_VISIBLE_PROGRESS_MESSAGES,
+) -> tuple[tuple[str, ...], int]:
+    """Return a bounded recent history while leaving session state unchanged."""
+    if limit < 1:
+        raise ValueError("limit must be at least 1.")
+    messages = tuple(str(message) for message in progress_messages)
+    visible_messages = messages[-limit:]
+    return visible_messages, len(messages) - len(visible_messages)
 
 
 def render_app() -> None:
@@ -713,11 +727,28 @@ def _render_redaction_results() -> None:
         input_column.metric("Input tokens", summary["input_tokens"])
         output_column.metric("Output tokens", summary["output_tokens"])
 
+    zip_bytes = st.session_state[ZIP_BYTES_STATE_KEY]
+    st.download_button(
+        "Download generated zip",
+        data=zip_bytes,
+        file_name="redacted-transcripts.zip",
+        mime="application/zip",
+        disabled=not zip_bytes or summary["complete_count"] == 0,
+    )
+
     progress_messages = st.session_state[REDACTION_PROGRESS_STATE_KEY]
     if progress_messages:
         with st.expander("Progress messages"):
-            for message in progress_messages:
-                st.write(message)
+            visible_messages, omitted_count = prepare_progress_history_display(
+                progress_messages
+            )
+            if omitted_count:
+                st.caption(
+                    f"Showing the most recent {len(visible_messages):,} of "
+                    f"{len(progress_messages):,} messages; "
+                    f"{omitted_count:,} earlier messages remain stored in this session."
+                )
+            st.code("\n".join(visible_messages), language=None)
 
     result_rows = st.session_state[REDACTION_RESULT_ROWS_STATE_KEY]
     if result_rows:
@@ -727,15 +758,6 @@ def _render_redaction_results() -> None:
     if failed_rows:
         st.error("Some items failed. Successful outputs remain available.")
         st.dataframe(failed_rows, hide_index=True, width="stretch")
-
-    zip_bytes = st.session_state[ZIP_BYTES_STATE_KEY]
-    st.download_button(
-        "Download generated zip",
-        data=zip_bytes,
-        file_name="redacted-transcripts.zip",
-        mime="application/zip",
-        disabled=not zip_bytes or summary["complete_count"] == 0,
-    )
 
 
 def _safe_uploaded_relative_path(uploaded_name: str) -> Path:
