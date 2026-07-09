@@ -43,6 +43,8 @@ V2RedactionErrorCategory = Literal[
     "preserve_mask_damage",
     "parsed_item_not_ready",
 ]
+V2ChunkLifecycleStatus = Literal["running", "retrying", "complete", "failed"]
+V2ChunkProgressCallback = Callable[["V2ChunkLifecycleEvent"], None]
 
 _RETRYABLE_CATEGORIES: frozenset[str] = frozenset(
     {
@@ -146,6 +148,25 @@ class V2ChunkMetadata:
 
 
 @dataclass(frozen=True)
+class V2ChunkLifecycleEvent:
+    """Privacy-safe lifecycle update emitted while one chunk is processed."""
+
+    status: V2ChunkLifecycleStatus
+    chunk_index: int
+    chunk_count: int
+    attempt_number: int
+    max_attempts: int
+    error_categories: tuple[V2RedactionErrorCategory, ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "error_categories", tuple(self.error_categories)
+        )
+
+
+@dataclass(frozen=True)
 class V2RedactionMetadata:
     """Privacy-safe service summary for one parsed item."""
 
@@ -204,6 +225,7 @@ class V2RedactionService:
         preserved_values: Iterable[str] = (),
         backoff_seconds: float = 0.0,
         backoff_multiplier: float = 2.0,
+        progress_callback: V2ChunkProgressCallback | None = None,
     ) -> V2RedactionServiceResult:
         """Redact one parsed item with sentence-chunk validation and retries."""
         chunk_size = _require_positive_int(
@@ -263,6 +285,8 @@ class V2RedactionService:
                 max_attempts=attempt_limit,
                 backoff_seconds=backoff_seconds,
                 backoff_multiplier=backoff_multiplier,
+                chunk_count=len(chunks),
+                progress_callback=progress_callback,
             )
             chunk_metadata.append(chunk_result.metadata)
             if chunk_result.success:
@@ -314,11 +338,22 @@ class V2RedactionService:
         max_attempts: int,
         backoff_seconds: float,
         backoff_multiplier: float,
+        chunk_count: int,
+        progress_callback: V2ChunkProgressCallback | None,
     ) -> _V2ChunkRunResult:
         last_categories: tuple[V2RedactionErrorCategory, ...] = ()
         usage = V2UsageTotals()
 
         for attempt_number in range(1, max_attempts + 1):
+            if attempt_number == 1:
+                _emit_chunk_lifecycle_event(
+                    progress_callback,
+                    status="running",
+                    chunk_index=chunk_index,
+                    chunk_count=chunk_count,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                )
             try:
                 api_result = self._client.redact_sentence_batch(
                     model_id=model_id,
@@ -329,6 +364,14 @@ class V2RedactionService:
                     masked_batch,
                 )
                 usage = usage.add(api_result.usage)
+                _emit_chunk_lifecycle_event(
+                    progress_callback,
+                    status="complete",
+                    chunk_index=chunk_index,
+                    chunk_count=chunk_count,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                )
                 return _V2ChunkRunResult(
                     success=True,
                     restored_text_by_id=restored_text_by_id,
@@ -351,6 +394,15 @@ class V2RedactionService:
                 retryable = True
 
             if not retryable or attempt_number >= max_attempts:
+                _emit_chunk_lifecycle_event(
+                    progress_callback,
+                    status="failed",
+                    chunk_index=chunk_index,
+                    chunk_count=chunk_count,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    error_categories=last_categories,
+                )
                 return _V2ChunkRunResult(
                     success=False,
                     restored_text_by_id={},
@@ -364,6 +416,15 @@ class V2RedactionService:
                     ),
                 )
 
+            _emit_chunk_lifecycle_event(
+                progress_callback,
+                status="retrying",
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
+                attempt_number=attempt_number + 1,
+                max_attempts=max_attempts,
+                error_categories=last_categories,
+            )
             _sleep_before_retry(
                 self._sleep,
                 attempt_number=attempt_number,
@@ -414,6 +475,30 @@ class V2RedactionService:
                 error_categories=error_categories,
             ),
         )
+
+
+def _emit_chunk_lifecycle_event(
+    progress_callback: V2ChunkProgressCallback | None,
+    *,
+    status: V2ChunkLifecycleStatus,
+    chunk_index: int,
+    chunk_count: int,
+    attempt_number: int,
+    max_attempts: int,
+    error_categories: tuple[V2RedactionErrorCategory, ...] = (),
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(
+        V2ChunkLifecycleEvent(
+            status=status,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
+            attempt_number=attempt_number,
+            max_attempts=max_attempts,
+            error_categories=error_categories,
+        )
+    )
 
 
 @dataclass(frozen=True)

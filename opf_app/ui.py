@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+import queue
 import re
 import tempfile
+import threading
 from typing import Any, Sequence
 
 import streamlit as st
@@ -25,7 +28,9 @@ from .models import ParsedItem
 from .ocs_csv import OcsCsvValidationError, parse_ocs_csv_text
 from .responses_client import ResponsesRedactionClient
 from .v2_batch import (
+    V2BatchProgressEvent,
     V2BatchResult,
+    V2ProgressSnapshot,
     V2RedactionServiceLike,
     clamp_v2_api_concurrency,
     clamp_v2_sentence_chunk_size,
@@ -207,8 +212,9 @@ def run_v2_redaction_for_ui(
     preserved_values: tuple[str, ...] | list[str] = (),
     retry_limit: int = RETRY_ATTEMPTS_DEFAULT,
     redaction_service: V2RedactionServiceLike | None = None,
+    progress_callback: Callable[[V2BatchProgressEvent], None] | None = None,
 ) -> V2RedactionUiOutcome:
-    """Run v2 redaction and return only privacy-safe UI data."""
+    """Run v2 redaction while relaying worker events on the calling thread."""
     service = redaction_service
     if service is None:
         service = V2RedactionService(
@@ -216,22 +222,78 @@ def run_v2_redaction_for_ui(
         )
 
     progress_messages: list[str] = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        batch_result = run_v2_redaction_batch(
-            tuple(items),
-            model_id=model_id,
-            redaction_service=service,
-            output_dir=tmpdir,
-            sentence_chunk_size=sentence_chunk_size,
-            api_concurrency=api_concurrency,
-            retry_limit=retry_limit,
-            preserved_values=tuple(preserved_values),
-            progress_callback=lambda event: progress_messages.append(event.message),
+    progress_queue: queue.Queue[
+        tuple[V2BatchProgressEvent, threading.Event | None]
+    ] = queue.Queue()
+    worker_done = threading.Event()
+    result_holder: list[tuple[V2BatchResult, bytes]] = []
+    worker_errors: list[BaseException] = []
+
+    def enqueue_progress(event: V2BatchProgressEvent) -> None:
+        acknowledgement = (
+            threading.Event() if event.event_type == "plan" else None
         )
-        zip_bytes = batch_result.zip_path.read_bytes()
-        result_rows = tuple(prepare_v2_redaction_result_rows(batch_result))
-        failed_rows = tuple(prepare_v2_failed_redaction_rows(batch_result))
-        summary = prepare_v2_run_summary(batch_result)
+        progress_queue.put((event, acknowledgement))
+        if acknowledgement is not None:
+            acknowledgement.wait()
+
+    def run_batch() -> None:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                batch_result = run_v2_redaction_batch(
+                    tuple(items),
+                    model_id=model_id,
+                    redaction_service=service,
+                    output_dir=tmpdir,
+                    sentence_chunk_size=sentence_chunk_size,
+                    api_concurrency=api_concurrency,
+                    retry_limit=retry_limit,
+                    preserved_values=tuple(preserved_values),
+                    progress_callback=enqueue_progress,
+                )
+                result_holder.append(
+                    (batch_result, batch_result.zip_path.read_bytes())
+                )
+        except BaseException as exc:  # noqa: BLE001 - re-raise on caller thread
+            worker_errors.append(exc)
+        finally:
+            worker_done.set()
+
+    worker = threading.Thread(
+        target=run_batch,
+        name="v2-redaction-ui-worker",
+        daemon=True,
+    )
+    worker.start()
+
+    callback_error: BaseException | None = None
+    while not worker_done.is_set() or not progress_queue.empty():
+        try:
+            event, acknowledgement = progress_queue.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        try:
+            progress_messages.append(event.message)
+            if progress_callback is not None and callback_error is None:
+                progress_callback(event)
+        except BaseException as exc:  # noqa: BLE001 - finish worker before raising
+            callback_error = exc
+        finally:
+            if acknowledgement is not None:
+                acknowledgement.set()
+
+    worker.join()
+    if callback_error is not None:
+        raise callback_error
+    if worker_errors:
+        raise worker_errors[0]
+    if not result_holder:
+        raise RuntimeError("V2 redaction worker completed without a result.")
+
+    batch_result, zip_bytes = result_holder[0]
+    result_rows = tuple(prepare_v2_redaction_result_rows(batch_result))
+    failed_rows = tuple(prepare_v2_failed_redaction_rows(batch_result))
+    summary = prepare_v2_run_summary(batch_result)
 
     return V2RedactionUiOutcome(
         total_count=batch_result.total_count,
@@ -298,8 +360,10 @@ def prepare_v2_run_summary(batch_result: V2BatchResult) -> dict[str, object]:
         "complete_count": summary.complete_item_count,
         "failed_count": summary.failed_item_count,
         "total_sentence_count": summary.total_sentence_count,
+        "planned_chunk_count": summary.planned_chunk_count,
         "successful_chunk_count": summary.successful_chunk_count,
         "failed_chunk_count": summary.failed_chunk_count,
+        "skipped_chunk_count": summary.skipped_chunk_count,
         "retry_count": summary.retry_count,
         "input_tokens": usage["input_tokens"],
         "output_tokens": usage["output_tokens"],
@@ -504,21 +568,66 @@ def _render_redaction_controls() -> None:
             st.error(str(exc))
             return
 
+        progress_bar = st.progress(0, text="0% complete")
         status = st.empty()
-        status.info("Running v2 redaction...")
-        with st.spinner("Processing parsed items with the Responses API"):
-            outcome = run_v2_redaction_for_ui(
-                items,
-                api_key=credential.require_value(),
-                model_id=model_id,
-                sentence_chunk_size=clamp_v2_sentence_chunk_size(
-                    int(sentence_chunk_size)
-                ),
-                api_concurrency=clamp_v2_api_concurrency(int(api_concurrency)),
-                preserved_values=preserved_values,
-            )
+        status.info("Preparing the local v2 API work plan...")
+        outcome = run_v2_redaction_for_ui(
+            items,
+            api_key=credential.require_value(),
+            model_id=model_id,
+            sentence_chunk_size=clamp_v2_sentence_chunk_size(
+                int(sentence_chunk_size)
+            ),
+            api_concurrency=clamp_v2_api_concurrency(int(api_concurrency)),
+            preserved_values=preserved_values,
+            progress_callback=lambda event: _render_v2_live_progress(
+                progress_bar,
+                status,
+                event,
+            ),
+        )
+        progress_bar.progress(100, text="100% complete")
         status.success("Redaction run complete.")
         _store_v2_redaction_outcome(outcome)
+
+
+def format_v2_progress_status(snapshot: V2ProgressSnapshot) -> str:
+    """Format privacy-safe live counts and a best-effort ETA."""
+    if snapshot.eta_seconds is None:
+        eta_text = "Estimating remaining time..."
+    else:
+        eta_text = (
+            "Estimated remaining time: about "
+            f"{_format_eta_duration(snapshot.eta_seconds)}."
+        )
+    return (
+        f"{snapshot.resolved_chunk_count}/{snapshot.total_chunk_count} chunks "
+        f"resolved; {snapshot.completed_item_count} items completed; "
+        f"{snapshot.failed_item_count} items failed; {eta_text}"
+    )
+
+
+def _render_v2_live_progress(
+    progress_bar: Any,
+    status: Any,
+    event: V2BatchProgressEvent,
+) -> None:
+    snapshot = event.snapshot
+    if snapshot is None:
+        return
+    progress_bar.progress(
+        snapshot.percentage,
+        text=f"{snapshot.percentage}% complete",
+    )
+    status.info(format_v2_progress_status(snapshot))
+
+
+def _format_eta_duration(seconds: float) -> str:
+    rounded_seconds = max(0, int(round(seconds)))
+    minutes, remaining_seconds = divmod(rounded_seconds, 60)
+    if minutes:
+        return f"{minutes}m {remaining_seconds:02d}s"
+    return f"{remaining_seconds}s"
 
 
 def _render_api_key_controls() -> ApiKeyCredential:
@@ -593,7 +702,8 @@ def _render_redaction_results() -> None:
             "Chunks",
             (
                 f"{summary['successful_chunk_count']} complete / "
-                f"{summary['failed_chunk_count']} failed"
+                f"{summary['failed_chunk_count']} failed / "
+                f"{summary['skipped_chunk_count']} skipped"
             ),
         )
         retry_column.metric("Retries", summary["retry_count"])
