@@ -11,7 +11,7 @@ from opf_app.masking import (
     validate_mask_tokens,
 )
 from opf_app.models import ParsedItem
-from opf_app.redaction import parse_preserved_values
+from opf_app.masking import parse_preserved_values
 from opf_app.sentences import reconstruct_body, segment_parsed_item
 
 

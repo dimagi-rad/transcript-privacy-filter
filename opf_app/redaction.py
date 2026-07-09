@@ -8,6 +8,7 @@ from typing import Any, Callable, Protocol
 
 from opf._common.label_space import BACKGROUND_CLASS_LABEL, SPAN_CLASS_NAMES_BY_CATEGORY_VERSION
 
+from .masking import parse_preserved_values
 from .models import ParsedItem, RedactionResult
 
 
@@ -169,20 +170,6 @@ def apply_selected_replacements(
         cursor = end
     pieces.append(text[cursor:])
     return "".join(pieces)
-
-
-def parse_preserved_values(raw_values: str) -> tuple[str, ...]:
-    """Parse comma-separated values while preserving input order."""
-    values: list[str] = []
-    seen: set[str] = set()
-    for raw_value in raw_values.split(","):
-        value = raw_value.strip()
-        normalized = _normalize_preserved_value(value)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        values.append(value)
-    return tuple(values)
 
 
 def _selected_unprotected_spans(

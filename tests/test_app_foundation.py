@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
+import sys
 
 
 def test_opf_app_imports() -> None:
@@ -15,7 +17,20 @@ def test_streamlit_entrypoint_imports() -> None:
     assert module.render_app is not None
 
 
-def test_opf_public_api_import_smoke() -> None:
-    from opf._api import OPF
+def test_streamlit_ui_import_does_not_load_legacy_opf_modules() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import opf_app.ui; "
+                "print(any(name == 'opf' or name.startswith('opf.') "
+                "for name in sys.modules))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
-    assert OPF.__name__ == "OPF"
+    assert result.stdout.strip() == "False"

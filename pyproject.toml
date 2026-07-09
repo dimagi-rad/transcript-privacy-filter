@@ -5,23 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "opf"
 version = "0.1.0"
-description = "Standalone local-only OPF PyTorch model and eval tools."
+description = "Local transcript redaction app using the OpenAI Responses API."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "huggingface_hub",
-  "numpy",
   "openai",
-  "packaging",
   "pypdf",
   "python-docx",
-  "torch",
-  "safetensors",
   "streamlit",
-  "tiktoken",
 ]
 
 [project.optional-dependencies]
+legacy-opf = [
+  "huggingface_hub",
+  "numpy",
+  "packaging",
+  "safetensors",
+  "tiktoken",
+  "torch",
+]
 test = [
   "pytest",
 ]

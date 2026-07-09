@@ -9,7 +9,6 @@ from typing import Any, Sequence
 import streamlit as st
 
 from . import APP_TITLE
-from .batch import BatchResult, clamp_concurrency, run_redaction_batch
 from .config import (
     API_CONCURRENCY_RANGE,
     RETRY_ATTEMPTS_DEFAULT,
@@ -21,14 +20,9 @@ from .config import (
     resolve_model_id,
 )
 from .documents import SUPPORTED_DOCUMENT_EXTENSIONS, parse_document
+from .masking import parse_preserved_values
 from .models import ParsedItem
 from .ocs_csv import OcsCsvValidationError, parse_ocs_csv_text
-from .redaction import (
-    DEFAULT_RUNTIME_LABELS,
-    RedactionService,
-    RedactorLike,
-    parse_preserved_values,
-)
 from .responses_client import ResponsesRedactionClient
 from .v2_batch import (
     V2BatchResult,
@@ -56,7 +50,6 @@ V2_MODEL_STATE_KEY = "v2_model_id"
 V2_CUSTOM_MODEL_STATE_KEY = "v2_custom_model_id"
 V2_SENTENCE_CHUNK_SIZE_STATE_KEY = "v2_sentence_chunk_size"
 V2_API_CONCURRENCY_STATE_KEY = "v2_api_concurrency"
-CATEGORY_STATE_PREFIX = "category_"
 SUPPORTED_UPLOAD_TYPES = tuple(
     extension.removeprefix(".") for extension in sorted(SUPPORTED_DOCUMENT_EXTENSIONS)
 )
@@ -68,17 +61,6 @@ class ParseOutcome:
     items: tuple[ParsedItem, ...] = field(default_factory=tuple)
     errors: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
-
-
-@dataclass(frozen=True)
-class RedactionUiOutcome:
-    total_count: int
-    complete_count: int
-    failed_count: int
-    zip_bytes: bytes
-    result_rows: tuple[dict[str, object], ...]
-    failed_rows: tuple[dict[str, str], ...]
-    progress_messages: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -215,64 +197,6 @@ def parse_uploaded_document_files(uploaded_files: Sequence[Any]) -> ParseOutcome
     return ParseOutcome(items=tuple(items), warnings=tuple(warnings))
 
 
-def category_state_keys(labels: tuple[str, ...] | list[str]) -> dict[str, str]:
-    return {label: f"{CATEGORY_STATE_PREFIX}{label}" for label in labels}
-
-
-def selected_categories_from_state(
-    labels: tuple[str, ...] | list[str],
-    state: dict[str, object],
-) -> tuple[str, ...]:
-    keys = category_state_keys(labels)
-    return tuple(label for label in labels if bool(state.get(keys[label], True)))
-
-
-def set_category_selection_state(
-    labels: tuple[str, ...] | list[str],
-    state: dict[str, object],
-    *,
-    selected: bool,
-) -> None:
-    for key in category_state_keys(labels).values():
-        state[key] = selected
-
-
-def run_redaction_for_ui(
-    items: tuple[ParsedItem, ...] | list[ParsedItem],
-    *,
-    selected_labels: tuple[str, ...] | list[str],
-    preserved_values: tuple[str, ...] | list[str] = (),
-    concurrency: int,
-    redactor: RedactorLike | None = None,
-) -> RedactionUiOutcome:
-    """Run local redaction and return UI-safe rows plus zip bytes."""
-    progress_messages: list[str] = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        batch_result = run_redaction_batch(
-            tuple(items),
-            selected_labels=tuple(selected_labels),
-            preserved_values=tuple(preserved_values),
-            redaction_service=RedactionService(redactor),
-            output_dir=tmpdir,
-            concurrency=concurrency,
-            lock_redactor=True,
-            progress_callback=lambda event: progress_messages.append(event.message),
-        )
-        zip_bytes = batch_result.zip_path.read_bytes()
-        result_rows = tuple(prepare_redaction_result_rows(batch_result))
-        failed_rows = tuple(prepare_failed_redaction_rows(batch_result))
-
-    return RedactionUiOutcome(
-        total_count=batch_result.total_count,
-        complete_count=batch_result.complete_count,
-        failed_count=batch_result.failed_count,
-        zip_bytes=zip_bytes,
-        result_rows=result_rows,
-        failed_rows=failed_rows,
-        progress_messages=tuple(progress_messages),
-    )
-
-
 def run_v2_redaction_for_ui(
     items: tuple[ParsedItem, ...] | list[ParsedItem],
     *,
@@ -321,21 +245,6 @@ def run_v2_redaction_for_ui(
     )
 
 
-def prepare_redaction_result_rows(batch_result: BatchResult) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for item_result in batch_result.items:
-        rows.append(
-            {
-                "Item name": item_result.item.item_name,
-                "Status": item_result.status,
-                "Detected spans": item_result.redaction_result.detected_span_count,
-                "Selected redactions": item_result.redaction_result.selected_span_count,
-                "Output filename": item_result.output.filename,
-            }
-        )
-    return rows
-
-
 def prepare_v2_redaction_result_rows(
     batch_result: V2BatchResult,
 ) -> list[dict[str, object]]:
@@ -351,22 +260,6 @@ def prepare_v2_redaction_result_rows(
                 "Output filename": item_result.output.filename,
             }
         )
-    return rows
-
-
-def prepare_failed_redaction_rows(batch_result: BatchResult) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for item_result in batch_result.items:
-        if item_result.status != "failed":
-            continue
-        for error in item_result.redaction_result.errors or item_result.output.errors:
-            rows.append(
-                {
-                    "Item name": item_result.item.item_name,
-                    "Output filename": item_result.output.filename,
-                    "Error": error,
-                }
-            )
     return rows
 
 
@@ -423,9 +316,10 @@ def render_app() -> None:
 
     st.title(APP_TITLE)
     st.info(
-        "This app is designed for local transcript redaction. Source files and "
-        "transcript text should stay on this machine; do not paste sensitive "
-        "content into logs, issues, or support messages."
+        "Parsing, preserved-value masking, reconstruction, and outputs stay local. "
+        "Only masked sentence batches are sent to the configured OpenAI Responses "
+        "API. Review generated outputs and never paste sensitive content into logs, "
+        "issues, or support messages."
     )
 
     _ensure_session_state()
@@ -670,23 +564,6 @@ def _render_model_controls() -> str:
         help="Overrides the configured model dropdown when provided.",
     )
     return str(selected_model_id)
-
-
-def _ensure_category_state(labels: tuple[str, ...]) -> None:
-    for key in category_state_keys(labels).values():
-        st.session_state.setdefault(key, True)
-
-
-def _store_redaction_outcome(outcome: RedactionUiOutcome) -> None:
-    st.session_state[ZIP_BYTES_STATE_KEY] = outcome.zip_bytes
-    st.session_state[REDACTION_SUMMARY_STATE_KEY] = {
-        "total_count": outcome.total_count,
-        "complete_count": outcome.complete_count,
-        "failed_count": outcome.failed_count,
-    }
-    st.session_state[REDACTION_RESULT_ROWS_STATE_KEY] = outcome.result_rows
-    st.session_state[REDACTION_FAILED_ROWS_STATE_KEY] = outcome.failed_rows
-    st.session_state[REDACTION_PROGRESS_STATE_KEY] = outcome.progress_messages
 
 
 def _store_v2_redaction_outcome(outcome: V2RedactionUiOutcome) -> None:
