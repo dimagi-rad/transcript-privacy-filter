@@ -166,6 +166,55 @@ def test_v2_retry_and_usage_are_aggregated(tmp_path: Path) -> None:
     }
 
 
+def test_v2_summary_audit_fields_are_privacy_safe(tmp_path: Path) -> None:
+    service = TrackingV2Service(
+        metadata_by_item={
+            "item-0": _metadata(
+                total_sentence_count=2,
+                successful_chunk_count=1,
+                retry_count=1,
+                usage=V2UsageTotals(input_tokens=10, output_tokens=5, total_tokens=15),
+            )
+        },
+        redacted_text="<PRIVATE_PERSON> shared <SECRET>.",
+    )
+
+    result = run_v2_redaction_batch(
+        (
+            _item(
+                0,
+                body_text="[00:00] S1: Alice shared a private value.",
+            ),
+        ),
+        model_id="gpt-test-redactor",
+        redaction_service=service,
+        output_dir=tmp_path,
+        sentence_chunk_size=2,
+        api_concurrency=1,
+    )
+
+    summary = result.summary.privacy_safe_dict()
+
+    assert summary["model_id"] == "gpt-test-redactor"
+    assert summary["sentence_chunk_size"] == 2
+    assert summary["api_concurrency"] == 1
+    assert summary["total_sentence_count"] == 2
+    assert summary["successful_chunk_count"] == 1
+    assert summary["retry_count"] == 1
+    assert summary["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "cached_input_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    summary_blob = str(summary)
+    assert "Alice" not in summary_blob
+    assert "private value" not in summary_blob
+    assert "<PRIVATE_PERSON>" not in summary_blob
+    assert "<SECRET>" not in summary_blob
+
+
 def test_v2_progress_events_are_privacy_safe(tmp_path: Path) -> None:
     events = []
     sensitive_body = "[00:00] S1: Alice shared a private value."

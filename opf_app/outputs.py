@@ -17,6 +17,7 @@ _TRANSCRIPT_LINE_RE = re.compile(
     r"(?P<separator>:\s*)"
     r"(?P<body>.*)$"
 )
+V2_WORKFLOW_LABEL = "OpenAI Responses API v2"
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ def generate_docx_output(
     output_dir: str | Path,
     *,
     filename: str | None = None,
+    workflow_label: str | None = None,
+    include_source: bool = True,
 ) -> GeneratedOutput:
     """Generate one plain DOCX output file for a successful redaction result."""
     if not result.success:
@@ -66,12 +69,33 @@ def generate_docx_output(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_filename = filename or result.output_filename
     output_path = output_dir / output_filename
-    _write_redacted_docx(result, output_path)
+    _write_redacted_docx(
+        result,
+        output_path,
+        workflow_label=workflow_label,
+        include_source=include_source,
+    )
     return GeneratedOutput(
         source_name=result.item.source_name,
         filename=output_filename,
         path=output_path,
         success=True,
+    )
+
+
+def generate_v2_docx_output(
+    result: RedactionResult,
+    output_dir: str | Path,
+    *,
+    filename: str | None = None,
+) -> GeneratedOutput:
+    """Generate one v2 DOCX output with minimal privacy-safe metadata."""
+    return generate_docx_output(
+        result,
+        output_dir,
+        filename=filename,
+        workflow_label=V2_WORKFLOW_LABEL,
+        include_source=False,
     )
 
 
@@ -101,10 +125,45 @@ def package_successful_outputs(
     return OutputPackage(zip_path=zip_path, outputs=tuple(outputs))
 
 
-def _write_redacted_docx(result: RedactionResult, output_path: Path) -> None:
+def package_v2_successful_outputs(
+    results: list[RedactionResult] | tuple[RedactionResult, ...],
+    output_dir: str | Path,
+    *,
+    zip_name: str = "redacted-transcripts.zip",
+) -> OutputPackage:
+    """Write successful v2 DOCX outputs and package them into a zip archive."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    used_filenames: set[str] = set()
+    outputs: list[GeneratedOutput] = []
+    for result in results:
+        filename = _unique_filename(result, used_filenames)
+        used_filenames.add(filename)
+        outputs.append(generate_v2_docx_output(result, output_dir, filename=filename))
+
+    zip_path = output_dir / zip_name
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for output in outputs:
+            if output.success and output.path is not None:
+                archive.write(output.path, arcname=output.filename)
+
+    return OutputPackage(zip_path=zip_path, outputs=tuple(outputs))
+
+
+def _write_redacted_docx(
+    result: RedactionResult,
+    output_path: Path,
+    *,
+    workflow_label: str | None,
+    include_source: bool,
+) -> None:
     document = Document()
     document.add_heading("Redacted Transcript", level=1)
-    document.add_paragraph(f"Source: {result.item.source_name}")
+    if workflow_label:
+        document.add_paragraph(f"Redaction workflow: {workflow_label}")
+    if include_source:
+        document.add_paragraph(f"Source: {result.item.source_name}")
     document.add_paragraph(f"Chat date: {result.item.chat_date}")
     document.add_paragraph(f"User identifier: {result.item.user_identifier}")
     if result.item.session_id:
